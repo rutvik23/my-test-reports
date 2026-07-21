@@ -108,3 +108,22 @@ th, td {
   color: var(--accent);
   text-decoration: none;
 }
+
+.badge {
+  display: inline-block;
+  padding: 0.15em 0.6em;
+  border-radius: 12px;
+  font-size: 0.8em;
+  font-weight: 600;
+}
+
+.badge.pass { background: #d1f4d1; color: #116329; }
+.badge.fail { background: #ffd7d5; color: #82071e; }
+
+.actual {
+  border-left: 3px solid var(--accent);
+  padding-left: 1rem;
+  margin: 0.75rem 0 1.25rem;
+}
+
+.actual p { margin: 0 0 0.4rem; font-weight: 600; }

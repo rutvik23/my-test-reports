@@ -11,7 +11,9 @@
     <a class="back-link" href="../index.html#test-verification">&larr; All reports</a>
 
     <article>
-      <h1>Test Plan: PR #8787 &mdash; Make <code>deleteCLISecrets</code> non-fatal during cluster destroy</h1>
+      <h1>Test Plan: PR #8787 &mdash; Make <code>deleteCLISecrets</code> non-fatal during cluster destroy
+        <span class="badge pass">PASS</span>
+      </h1>
 
       <p>
         <strong>Repo</strong>: openshift/hypershift<br>
@@ -89,6 +91,21 @@
           normally use in this environment (e.g. the <code>hcp:hcp-create-aws</code> skill) for step 2 below.
         </li>
       </ul>
+
+      <h2>Execution Notes</h2>
+      <p>
+        Environment/credential issues hit before reaching a clean run &mdash; unrelated to the fix itself, listed
+        here so they don't need rediscovering next time:
+      </p>
+      <ul>
+        <li>Local <code>./bin/hcp</code> was stale (built before the <code>--kubeconfig</code> flag existed on <code>destroy cluster</code>) &mdash; rebuilt with <code>make product-cli</code>.</li>
+        <li><code>$PLATFORM</code> was unset in one shell, so cobra fell back to the parent <code>cluster</code> command and rejected <code>--sts-creds</code>/<code>--role-arn</code> as unknown flags &mdash; fixed by exporting it before invoking <code>hcp</code>.</li>
+        <li>Restricted ServiceAccount token (1h duration) expired mid-troubleshooting, causing a Kubernetes 401 &mdash; regenerated via <code>oc create token</code>.</li>
+        <li><code>sts:AssumeRole</code> returned <code>403 InvalidClientTokenId</code> &mdash; the <code>--sts-creds</code> file held stale/invalid credentials &mdash; regenerated via <code>aws sts get-session-token</code>.</li>
+        <li>IAM role used for the CLI (<code>--role-arn</code> target) was missing 5 actions needed to enumerate/detach policies during role teardown (<code>iam:ListAttachedRolePolicies</code>, <code>iam:ListRolePolicies</code>, <code>iam:DetachRolePolicy</code>, <code>iam:TagInstanceProfile</code>, <code>iam:TagOpenIDConnectProvider</code>) &mdash; diffed against the canonical policy in <code>cmd/infra/aws/create_cli_role.go</code> and added the missing statements.</li>
+        <li><code>sts:AssumeRole</code> returned <code>403 AccessDenied</code> &mdash; <code>$ROLE_ARN</code> was pointed at the caller's own IAM user ARN instead of the intended role ARN &mdash; corrected.</li>
+      </ul>
+      <p>Once these were resolved, the repro and fix verification below completed cleanly on the first try.</p>
 
       <h2>Step-by-step reproduction walkthrough</h2>
       <p>
@@ -174,14 +191,36 @@ oc auth can-i deletecollection secrets -n "${CLUSTER_NS}" --kubeconfig=/tmp/rest
 
       <h3>8. Run destroy with the pre-fix binary against the restricted kubeconfig</h3>
       <pre><code>./bin/hcp destroy cluster "${PLATFORM}" --name "${CLUSTER_NAME}" --namespace "${CLUSTER_NS}" \
+  --sts-creds $STS_CREDS --role-arn $ROLE_ARN \
   --kubeconfig /tmp/restricted-kubeconfig 2&gt;&amp;1 | tee /tmp/destroy-prefix.log
 echo "exit code: ${PIPESTATUS[0]}"</code></pre>
+      <div class="actual">
+        <p>Actual output <span class="badge pass">matches expected</span></p>
+        <pre><code>{"level":"info","msg":"Found hosted cluster","namespace":"rkhcp-cluster","name":"rkhcp"}
+{"level":"info","msg":"Destroying infrastructure","infraID":"rkhcp-xvcs4"}
+{"level":"info","msg":"Destroying IAM","infraID":"rkhcp-xvcs4"}
+{"level":"info","msg":"Deleted role","role":"rkhcp-xvcs4-openshift-ingress"}
+{"level":"info","msg":"Deleted role","role":"rkhcp-xvcs4-openshift-image-registry"}
+{"level":"info","msg":"Deleted role","role":"rkhcp-xvcs4-aws-ebs-csi-driver-controller"}
+{"level":"info","msg":"Deleted role","role":"rkhcp-xvcs4-cloud-controller"}
+{"level":"info","msg":"Deleted role","role":"rkhcp-xvcs4-node-pool"}
+{"level":"info","msg":"Deleted role","role":"rkhcp-xvcs4-control-plane-operator"}
+{"level":"info","msg":"Deleted role","role":"rkhcp-xvcs4-cloud-network-config-controller"}
+{"level":"info","msg":"Deleting Secrets","namespace":"rkhcp-cluster"}
+{"level":"error","msg":"Failed to destroy cluster","error":"failed to clean up secrets in rkhcp-cluster namespace: secrets is forbidden: User \"system:serviceaccount:rkhcp-cluster:hcp-destroy-no-deletecollection\" cannot deletecollection resource \"secrets\" in API group \"\" in the namespace \"rkhcp-cluster\""}
+Error: failed to clean up secrets in rkhcp-cluster namespace: secrets is forbidden: ...</code></pre>
+      </div>
 
       <h3>9. Verify the bug: HostedCluster is stuck, not deleted</h3>
       <pre><code>grep -i "forbidden" /tmp/destroy-prefix.log         # the deletecollection 403
 oc get hostedcluster "${CLUSTER_NAME}" -n "${CLUSTER_NS}" \
   -o jsonpath='{.metadata.finalizers}{"\n"}{.metadata.deletionTimestamp}{"\n"}'
 # expect: ["openshift.io/destroy-cluster", ...] and a non-empty deletionTimestamp</code></pre>
+      <div class="actual">
+        <p>Actual output <span class="badge pass">matches expected</span></p>
+        <pre><code>["openshift.io/destroy-cluster"]
+2026-07-21T07:16:38Z</code></pre>
+      </div>
       <p>This confirms the pre-fix hang. The cluster stays in this stuck state until step 13.</p>
 
       <h3>10. Switch to the fix branch and rebuild the CLI</h3>
@@ -191,11 +230,36 @@ grep -n -A3 "if err = deleteCLISecrets" cmd/cluster/core/destroy.go
 # expect to see the error now logged, not returned fatally
 
 make product-cli                          # rebuilds ./bin/hcp with the fix</code></pre>
+      <div class="actual">
+        <p>Actual output <span class="badge pass">matches expected</span></p>
+        <pre><code>On branch fix/OCPBUGS-86669-destroy-finalizer
+nothing to commit, working tree clean
+e9883b43f2 (HEAD -&gt; fix/OCPBUGS-86669-destroy-finalizer, origin/fix/OCPBUGS-86669-destroy-finalizer) fix(cli): make deleteCLISecrets non-fatal during cluster destroy
+
+172:	if err = deleteCLISecrets(ctx, o, c); err != nil {
+173-		o.Log.Info("Failed to delete CLI generated secrets, skipping",
+174-			"error", err.Error(), "namespace", o.Namespace)
+175-	}</code></pre>
+      </div>
 
       <h3>11. Re-run destroy against the same stuck cluster, same restricted kubeconfig</h3>
       <pre><code>./bin/hcp destroy cluster "${PLATFORM}" --name "${CLUSTER_NAME}" --namespace "${CLUSTER_NS}" \
+  --sts-creds $STS_CREDS --role-arn $ROLE_ARN \
   --kubeconfig /tmp/restricted-kubeconfig 2&gt;&amp;1 | tee /tmp/destroy-postfix.log
 echo "exit code: ${PIPESTATUS[0]}"</code></pre>
+      <div class="actual">
+        <p>Actual output <span class="badge pass">matches expected</span></p>
+        <pre><code>{"level":"info","msg":"Found hosted cluster","namespace":"rkhcp-cluster","name":"rkhcp"}
+{"level":"info","msg":"Destroying infrastructure","infraID":"rkhcp-xvcs4"}
+{"level":"info","msg":"Destroying IAM","infraID":"rkhcp-xvcs4"}
+{"level":"info","msg":"Role already deleted!","role":"rkhcp-xvcs4-openshift-ingress"}
+{"level":"info","msg":"Role already deleted!","role":"rkhcp-xvcs4-cloud-controller"}
+{"level":"info","msg":"Role already deleted!","role":"rkhcp-xvcs4-node-pool"}
+{"level":"info","msg":"Deleting Secrets","namespace":"rkhcp-cluster"}
+{"level":"info","msg":"Failed to delete CLI generated secrets, skipping","error":"failed to clean up secrets in rkhcp-cluster namespace: secrets is forbidden: ...","namespace":"rkhcp-cluster"}
+{"level":"info","msg":"Finalized hosted cluster","namespace":"rkhcp-cluster","name":"rkhcp"}
+{"level":"info","msg":"Successfully destroyed cluster and infrastructure","namespace":"rkhcp-cluster","name":"rkhcp","infraID":"rkhcp-xvcs4"}</code></pre>
+      </div>
 
       <h3>12. Verify the fix: non-fatal log message, finalizer cleared, exit 0</h3>
       <pre><code>grep -i "Failed to delete CLI generated secrets, skipping" /tmp/destroy-postfix.log
@@ -203,12 +267,23 @@ echo "exit code: ${PIPESTATUS[0]}"</code></pre>
 # should return NotFound, not a HostedCluster with a deletionTimestamp/finalizer
 oc get hostedcluster "${CLUSTER_NAME}" -n "${CLUSTER_NS}" -o jsonpath='{.metadata.finalizers}'
 oc get hostedcluster "${CLUSTER_NAME}" -n "${CLUSTER_NS}"</code></pre>
+      <div class="actual">
+        <p>Actual output <span class="badge pass">matches expected</span></p>
+        <pre><code>{"level":"info","msg":"Failed to delete CLI generated secrets, skipping","error":"...forbidden...","namespace":"rkhcp-cluster"}
+
+Error from server (NotFound): hostedclusters.hypershift.openshift.io "rkhcp" not found
+Error from server (NotFound): hostedclusters.hypershift.openshift.io "rkhcp" not found</code></pre>
+      </div>
 
       <h3>13. Verify secrets are still cleaned up despite the CLI skipping explicit deletion</h3>
       <pre><code>oc get secrets -n "${CLUSTER_NS}" -l hypershift.openshift.io/auto-created-for-infra="${INFRA_ID}"
 # expect: No resources found (removed via owner-ref GC or control-plane namespace deletion)
 oc get namespace "${CLUSTER_NS}-${CLUSTER_NAME}"
 # expect: NotFound</code></pre>
+      <div class="actual">
+        <p>Actual output <span class="badge pass">matches expected</span></p>
+        <pre><code>No resources found in rkhcp-cluster namespace.</code></pre>
+      </div>
 
       <h3>14. Clean up the restricted RBAC objects</h3>
       <pre><code>oc delete rolebinding "${SA_NAME}" -n "${CLUSTER_NS}"
