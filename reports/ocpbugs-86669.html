@@ -92,21 +92,6 @@
         </li>
       </ul>
 
-      <h2>Execution Notes</h2>
-      <p>
-        Environment/credential issues hit before reaching a clean run &mdash; unrelated to the fix itself, listed
-        here so they don't need rediscovering next time:
-      </p>
-      <ul>
-        <li>Local <code>./bin/hcp</code> was stale (built before the <code>--kubeconfig</code> flag existed on <code>destroy cluster</code>) &mdash; rebuilt with <code>make product-cli</code>.</li>
-        <li><code>$PLATFORM</code> was unset in one shell, so cobra fell back to the parent <code>cluster</code> command and rejected <code>--sts-creds</code>/<code>--role-arn</code> as unknown flags &mdash; fixed by exporting it before invoking <code>hcp</code>.</li>
-        <li>Restricted ServiceAccount token (1h duration) expired mid-troubleshooting, causing a Kubernetes 401 &mdash; regenerated via <code>oc create token</code>.</li>
-        <li><code>sts:AssumeRole</code> returned <code>403 InvalidClientTokenId</code> &mdash; the <code>--sts-creds</code> file held stale/invalid credentials &mdash; regenerated via <code>aws sts get-session-token</code>.</li>
-        <li>IAM role used for the CLI (<code>--role-arn</code> target) was missing 5 actions needed to enumerate/detach policies during role teardown (<code>iam:ListAttachedRolePolicies</code>, <code>iam:ListRolePolicies</code>, <code>iam:DetachRolePolicy</code>, <code>iam:TagInstanceProfile</code>, <code>iam:TagOpenIDConnectProvider</code>) &mdash; diffed against the canonical policy in <code>cmd/infra/aws/create_cli_role.go</code> and added the missing statements.</li>
-        <li><code>sts:AssumeRole</code> returned <code>403 AccessDenied</code> &mdash; <code>$ROLE_ARN</code> was pointed at the caller's own IAM user ARN instead of the intended role ARN &mdash; corrected.</li>
-      </ul>
-      <p>Once these were resolved, the repro and fix verification below completed cleanly on the first try.</p>
-
       <h2>Step-by-step reproduction walkthrough</h2>
       <p>
         Run these in order. Steps 1&ndash;11 reproduce the bug on the unfixed code; steps 12&ndash;16 verify the fix
