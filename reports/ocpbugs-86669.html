@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OCPBUGS-86669 &mdash; Test Report</title>
+  <link rel="stylesheet" href="../style.css">
+</head>
+<body>
+  <main>
+    <a class="back-link" href="../index.html#test-verification">&larr; All reports</a>
+
+    <article>
+      <h1>Test Plan: PR #8787 &mdash; Make <code>deleteCLISecrets</code> non-fatal during cluster destroy</h1>
+
+      <p>
+        <strong>Repo</strong>: openshift/hypershift<br>
+        <strong>PR</strong>: <a href="https://github.com/openshift/hypershift/pull/8787">https://github.com/openshift/hypershift/pull/8787</a><br>
+        <strong>JIRA</strong>: <a href="https://issues.redhat.com/browse/OCPBUGS-86669">OCPBUGS-86669</a>
+      </p>
+
+      <h2>PR Summary</h2>
+      <p>
+        <code>hcp destroy cluster</code> (the HyperShift destroy CLI flow) sets the
+        <code>openshift.io/destroy-cluster</code> finalizer on the HostedCluster, then runs, in order:
+      </p>
+      <pre><code>setFinalizer() &rarr; destroyPlatformSpecifics() &rarr; deleteCLISecrets() &rarr; removeFinalizer()</code></pre>
+      <p>
+        <code>deleteCLISecrets</code> calls <code>client.DeleteAllOf</code> on Secrets, which requires the
+        <code>deletecollection</code> RBAC verb &mdash; a distinct verb from <code>list</code>/<code>get</code>/<code>delete</code>.
+        If the credentials running the CLI lack that verb, the call errors, <code>DestroyCluster</code> returns early,
+        and <code>removeFinalizer</code> never runs &mdash; the HostedCluster is stuck forever with a
+        <code>deletionTimestamp</code> and the destroy finalizer still attached.
+      </p>
+
+      <p><strong>Changes</strong>:</p>
+      <ul>
+        <li>
+          <code>cmd/cluster/core/destroy.go</code>: <code>deleteCLISecrets</code> errors are now logged and swallowed
+          instead of aborting the destroy flow (secrets are owner-ref'd to the HostedCluster and get garbage
+          collected, or removed when the operator deletes the control-plane namespace). Also introduces a
+          package-level <code>newClient</code> var (defaults to <code>util.GetClientWithKubeconfig</code>) so tests
+          can inject a client with interceptor-based error injection.
+        </li>
+        <li>
+          <code>cmd/util/client.go</code>: the fake client used when <code>FAKE_CLIENT=true</code> now registers
+          <code>hyperapi.Scheme</code> (superset of the default k8s scheme) instead of the bare default scheme, so
+          tests can use HyperShift types like <code>HostedCluster</code>.
+        </li>
+        <li>
+          <code>cmd/cluster/core/destroy_test.go</code>: adds two new unit tests &mdash; one exercising the full
+          destroy flow with a real (non-nil) <code>HostedCluster</code> and asserting the destroy finalizer
+          lifecycle, and one that forces <code>deleteCLISecrets</code> to fail (via an interceptor returning
+          <code>403 Forbidden</code> on <code>DeleteAllOf</code> for Secrets) and asserts <code>DestroyCluster</code>
+          still returns no error.
+        </li>
+      </ul>
+
+      <h2>Key fact established during investigation</h2>
+      <p>
+        Built-in <code>admin</code>/<code>edit</code> ClusterRoles and cluster-admin already include
+        <code>deletecollection</code> on secrets, so <strong>a normal admin kubeconfig against a freshly-installed
+        HostedCluster will never hit this bug</strong>. Reproducing it requires deliberately creating a Role that
+        grants secret <code>delete</code> but omits <code>deletecollection</code>. There is no shortcut around this
+        setup &mdash; the walkthrough below builds it explicitly.
+      </p>
+      <p>Repo state (verified 2026-07-21, local clone of <code>openshift/hypershift</code>):</p>
+      <ul>
+        <li>
+          <code>main</code> (HEAD <code>1aca754107</code>) still has the <strong>unfixed</strong> code &mdash;
+          <code>cmd/cluster/core/destroy.go:167</code> returns fatally on any <code>deleteCLISecrets</code> error.
+          This is your pre-fix binary; no need to check out an older commit.
+        </li>
+        <li>
+          <code>fix/OCPBUGS-86669-destroy-finalizer</code> (commit <code>e9883b43f2</code>, built directly on top of
+          <code>main</code> at <code>f69e73409f</code>) has the fix. This is your post-fix binary.
+        </li>
+      </ul>
+
+      <h2>Prerequisites</h2>
+      <ul>
+        <li>
+          A HyperShift management cluster you're logged into as cluster-admin via <code>oc</code>, with
+          <code>oc</code> and <code>go</code> available locally, and this repo cloned.
+        </li>
+        <li>
+          Ability to create/delete a HostedCluster (any supported platform &mdash; AWS is easiest to reproduce the
+          RBAC scenario against, but the core logic is platform-agnostic). Use whichever cluster-creation flow you
+          normally use in this environment (e.g. the <code>hcp:hcp-create-aws</code> skill) for step 2 below.
+        </li>
+      </ul>
+
+      <h2>Step-by-step reproduction walkthrough</h2>
+      <p>
+        Run these in order. Steps 1&ndash;11 reproduce the bug on the unfixed code; steps 12&ndash;16 verify the fix
+        resolves it, reusing the same stuck cluster and restricted kubeconfig.
+      </p>
+
+      <h3>0. Set variables</h3>
+      <pre><code>export CLUSTER_NAME=destroy-repro-1
+export CLUSTER_NS=clusters                # namespace holding the HostedCluster
+export PLATFORM=aws                       # or your platform of choice
+export SA_NAME=hcp-destroy-no-deletecollection</code></pre>
+
+      <h3>1. Confirm you're on the pre-fix code and build the CLI</h3>
+      <pre><code>cd hypershift
+git status                                # should be clean, on main
+git log --oneline -1                      # sanity-check HEAD
+grep -n -A3 "if err = deleteCLISecrets" cmd/cluster/core/destroy.go
+# expect to see: return err   (no logging/swallow &mdash; this confirms pre-fix)
+
+make product-cli                          # builds ./bin/hcp
+./bin/hcp version</code></pre>
+
+      <h3>2. Create a fresh HostedCluster and wait for it to become Available</h3>
+      <pre><code># Use your normal cluster-creation flow for $PLATFORM, naming the cluster $CLUSTER_NAME
+# in namespace $CLUSTER_NS. Then wait for Available:
+oc get hostedcluster "${CLUSTER_NAME}" -n "${CLUSTER_NS}" \
+  -o jsonpath='{.status.conditions[?(@.type=="Available")].status}{"\n"}'
+
+export INFRA_ID=$(oc get hostedcluster "${CLUSTER_NAME}" -n "${CLUSTER_NS}" \
+  -o jsonpath='{.spec.infraID}')
+echo "INFRA_ID=${INFRA_ID}"</code></pre>
+
+      <h3>3. Note the CLI-generated secrets before destroy (for later GC verification)</h3>
+      <pre><code>oc get secrets -n "${CLUSTER_NS}" -l hypershift.openshift.io/auto-created-for-infra="${INFRA_ID}" \
+  -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.metadata.ownerReferences[*].kind}/{.metadata.ownerReferences[*].name}{"\n"}{end}'</code></pre>
+
+      <h3>4. Create the restrictive Role (secrets <code>delete</code> allowed, <code>deletecollection</code> withheld)</h3>
+      <pre><code>cat &lt;&lt;EOF | oc apply -f -
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: ${SA_NAME}
+  namespace: ${CLUSTER_NS}
+rules:
+- apiGroups: [""]
+  resources: ["secrets"]
+  verbs: ["get", "list", "watch", "create", "update", "patch", "delete"] # no "deletecollection"
+- apiGroups: ["hypershift.openshift.io"]
+  resources: ["hostedclusters"]
+  verbs: ["get", "list", "watch", "update", "patch", "delete"]
+EOF</code></pre>
+
+      <h3>5. Create the ServiceAccount and bind it to the restrictive Role</h3>
+      <pre><code>oc create serviceaccount "${SA_NAME}" -n "${CLUSTER_NS}"
+
+oc create rolebinding "${SA_NAME}" \
+  --role="${SA_NAME}" \
+  --serviceaccount="${CLUSTER_NS}:${SA_NAME}" \
+  -n "${CLUSTER_NS}"</code></pre>
+
+      <h3>6. Generate a kubeconfig for the restricted ServiceAccount</h3>
+      <pre><code>TOKEN=$(oc create token "${SA_NAME}" -n "${CLUSTER_NS}" --duration=1h)
+SERVER=$(oc whoami --show-server)
+
+oc config set-cluster restricted-cluster --server="${SERVER}" --insecure-skip-tls-verify=true \
+  --kubeconfig=/tmp/restricted-kubeconfig
+oc config set-credentials "${SA_NAME}" --token="${TOKEN}" \
+  --kubeconfig=/tmp/restricted-kubeconfig
+oc config set-context restricted --cluster=restricted-cluster --user="${SA_NAME}" \
+  --namespace="${CLUSTER_NS}" --kubeconfig=/tmp/restricted-kubeconfig
+oc config use-context restricted --kubeconfig=/tmp/restricted-kubeconfig</code></pre>
+
+      <h3>7. Sanity-check the restriction is actually in place</h3>
+      <pre><code># should succeed (delete is allowed)
+oc auth can-i delete secrets -n "${CLUSTER_NS}" --kubeconfig=/tmp/restricted-kubeconfig
+# should print "no" (deletecollection is NOT granted)
+oc auth can-i deletecollection secrets -n "${CLUSTER_NS}" --kubeconfig=/tmp/restricted-kubeconfig</code></pre>
+      <p>
+        If the second command prints anything other than <code>no</code>, stop and fix the Role &mdash; the
+        reproduction will not work otherwise.
+      </p>
+
+      <h3>8. Run destroy with the pre-fix binary against the restricted kubeconfig</h3>
+      <pre><code>./bin/hcp destroy cluster "${PLATFORM}" --name "${CLUSTER_NAME}" --namespace "${CLUSTER_NS}" \
+  --kubeconfig /tmp/restricted-kubeconfig 2&gt;&amp;1 | tee /tmp/destroy-prefix.log
+echo "exit code: ${PIPESTATUS[0]}"</code></pre>
+
+      <h3>9. Verify the bug: HostedCluster is stuck, not deleted</h3>
+      <pre><code>grep -i "forbidden" /tmp/destroy-prefix.log         # the deletecollection 403
+oc get hostedcluster "${CLUSTER_NAME}" -n "${CLUSTER_NS}" \
+  -o jsonpath='{.metadata.finalizers}{"\n"}{.metadata.deletionTimestamp}{"\n"}'
+# expect: ["openshift.io/destroy-cluster", ...] and a non-empty deletionTimestamp</code></pre>
+      <p>This confirms the pre-fix hang. The cluster stays in this stuck state until step 13.</p>
+
+      <h3>10. Switch to the fix branch and rebuild the CLI</h3>
+      <pre><code>git checkout fix/OCPBUGS-86669-destroy-finalizer
+git log --oneline -1                      # expect e9883b43f2
+grep -n -A3 "if err = deleteCLISecrets" cmd/cluster/core/destroy.go
+# expect to see the error now logged, not returned fatally
+
+make product-cli                          # rebuilds ./bin/hcp with the fix</code></pre>
+
+      <h3>11. Re-run destroy against the same stuck cluster, same restricted kubeconfig</h3>
+      <pre><code>./bin/hcp destroy cluster "${PLATFORM}" --name "${CLUSTER_NAME}" --namespace "${CLUSTER_NS}" \
+  --kubeconfig /tmp/restricted-kubeconfig 2&gt;&amp;1 | tee /tmp/destroy-postfix.log
+echo "exit code: ${PIPESTATUS[0]}"</code></pre>
+
+      <h3>12. Verify the fix: non-fatal log message, finalizer cleared, exit 0</h3>
+      <pre><code>grep -i "Failed to delete CLI generated secrets, skipping" /tmp/destroy-postfix.log
+
+# should return NotFound, not a HostedCluster with a deletionTimestamp/finalizer
+oc get hostedcluster "${CLUSTER_NAME}" -n "${CLUSTER_NS}" -o jsonpath='{.metadata.finalizers}'
+oc get hostedcluster "${CLUSTER_NAME}" -n "${CLUSTER_NS}"</code></pre>
+
+      <h3>13. Verify secrets are still cleaned up despite the CLI skipping explicit deletion</h3>
+      <pre><code>oc get secrets -n "${CLUSTER_NS}" -l hypershift.openshift.io/auto-created-for-infra="${INFRA_ID}"
+# expect: No resources found (removed via owner-ref GC or control-plane namespace deletion)
+oc get namespace "${CLUSTER_NS}-${CLUSTER_NAME}"
+# expect: NotFound</code></pre>
+
+      <h3>14. Clean up the restricted RBAC objects</h3>
+      <pre><code>oc delete rolebinding "${SA_NAME}" -n "${CLUSTER_NS}"
+oc delete role "${SA_NAME}" -n "${CLUSTER_NS}"
+oc delete serviceaccount "${SA_NAME}" -n "${CLUSTER_NS}"
+rm -f /tmp/restricted-kubeconfig</code></pre>
+
+      <h2>Additional scenarios (optional, beyond the core repro)</h2>
+
+      <h3>A. Baseline: destroy succeeds when RBAC is sufficient (regression check)</h3>
+      <p>
+        Repeat steps 2&ndash;3 with a new cluster, then destroy using a full-access/admin kubeconfig instead of the
+        restricted one (skip steps 4&ndash;7). Expect the CLI to exit 0 and everything (secrets, HostedCluster,
+        namespace) to be gone &mdash; this confirms the fix didn't change behavior in the non-restricted path.
+      </p>
+
+      <h3>B. Verify <code>HostedCluster == nil</code> path is unaffected</h3>
+      <pre><code>oc get hostedcluster "${CLUSTER_NAME}" -n "${CLUSTER_NS}"
+# expect: NotFound (already deleted, only infra remains)
+
+./bin/hcp destroy cluster "${PLATFORM}" --name "${CLUSTER_NAME}" --namespace "${CLUSTER_NS}" \
+  --infra-id "${INFRA_ID}" --kubeconfig &lt;full-access-kubeconfig&gt; 2&gt;&amp;1 | tee /tmp/destroy-nil-hc.log
+echo "exit code: ${PIPESTATUS[0]}"</code></pre>
+      <p>
+        Expect <code>deleteCLISecrets</code> is still attempted (failure non-fatal if using the restricted
+        kubeconfig instead), platform-specific infra teardown still runs to completion, and the CLI exits 0.
+      </p>
+
+      <h3>C. Unit tests (automated, verify locally)</h3>
+      <pre><code>cd hypershift
+go test ./cmd/cluster/core/... -run TestDestroyCluster -v</code></pre>
+      <p>Expect both new subtests to pass:</p>
+      <ul>
+        <li>
+          <code>When destroying a hosted cluster with platform specifics, it should set the destroy finalizer and
+          complete successfully</code>
+        </li>
+        <li><code>When deleteCLISecrets fails it should log and continue</code></li>
+      </ul>
+      <p>And the existing subtest to keep passing:</p>
+      <ul>
+        <li><code>When HostedCluster is nil and platform specifics provided</code></li>
+      </ul>
+
+      <h2>Notes</h2>
+      <ul>
+        <li>
+          This is a CLI-only change (<code>cmd/cluster/core</code>, <code>cmd/util</code>) &mdash; no
+          operator/controller code paths are touched, so no HyperShift operator upgrade/downgrade testing is
+          required.
+        </li>
+        <li>
+          The fix intentionally keeps the <code>openshift.io/destroy-cluster</code> finalizer semantics unchanged
+          when <code>destroyPlatformSpecifics</code> itself fails &mdash; only <code>deleteCLISecrets</code>
+          failures are now non-fatal. Don't conflate this with masking other destroy failures; only the
+          secrets-cleanup step should be swallowed.
+        </li>
+        <li>Related: <a href="https://issues.redhat.com/browse/OCPBUGS-86669">OCPBUGS-86669</a>.</li>
+      </ul>
+    </article>
+  </main>
+</body>
+</html>
